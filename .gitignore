@@ -1,0 +1,12 @@
+fyers_token.json
+kite_token.json
+fno_universe_cache.json
+__pycache__/
+*.pyc
+*.pyo
+.env
+uploads/
+*.log
+.DS_Store
+venv/
+.venv/
