@@ -39,6 +39,7 @@ CACHE_FILE = "fno_universe_cache.json"
 CACHE_MAX_AGE_SEC = 7 * 24 * 60 * 60  # 1 week — NSE revises the F&O list quarterly
 
 _UNDERLYING_COL = 13
+_LOT_SIZE_COL = 3      # per Fyers' documented layout above; best-effort, see fetch_lot_sizes()
 _CM_TRADINGSYMBOL_COL = 13  # same position in NSE_CM.csv's row layout
 _FETCH_RETRIES = 3
 _FETCH_TIMEOUT_SEC = 30
@@ -146,6 +147,7 @@ def fetch_fo_stock_universe(force_refresh: bool = False) -> list:
         return sorted(FALLBACK_UNIVERSE)
 
     underlyings = set()
+    lot_sizes = {}   # underlying -> lot size, best-effort (see fetch_lot_sizes docstring)
     reader = csv.reader(text.splitlines())
     for row in reader:
         if len(row) <= _UNDERLYING_COL:
@@ -153,6 +155,11 @@ def fetch_fo_stock_universe(force_refresh: bool = False) -> list:
         underlying = row[_UNDERLYING_COL].strip()
         if underlying and underlying not in INDEX_UNDERLYINGS:
             underlyings.add(underlying)
+        if underlying and len(row) > _LOT_SIZE_COL:
+            try:
+                lot_sizes[underlying] = int(float(row[_LOT_SIZE_COL]))
+            except (ValueError, TypeError):
+                pass
 
     if not underlyings:
         logger.warning(
@@ -177,7 +184,40 @@ def fetch_fo_stock_universe(force_refresh: bool = False) -> list:
         return sorted(FALLBACK_UNIVERSE)
 
     with open(CACHE_FILE, "w") as f:
-        json.dump({"fetched_at": time.time(), "symbols": symbols}, f)
+        json.dump({"fetched_at": time.time(), "symbols": symbols,
+                    "lot_sizes": {s: lot_sizes[s] for s in symbols if s in lot_sizes}}, f)
 
     logger.info(f"Fetched {len(symbols)} F&O stocks, cached to {CACHE_FILE}.")
     return symbols
+
+
+def fetch_lot_sizes(force_refresh: bool = False) -> dict:
+    """Returns {underlying_symbol: lot_size} for NSE F&O stocks, e.g.
+    {"RELIANCE": 250, "TATAMOTORS": 1425, ...}.
+
+    Best-effort: lot size comes from column 3 of the same NSE_FO.csv used
+    for the universe list, per Fyers' documented layout (see module
+    docstring). This has NOT been verified against a live response — if
+    the numbers look wrong once you're running against real data (e.g.
+    traded-value filters in oi_surge.py rejecting everything, or accepting
+    obvious noise), that's the first thing to check. Returns {} if lot
+    sizes couldn't be parsed; callers should treat that as "skip
+    lot-size-dependent filtering" rather than failing outright.
+    """
+    if not force_refresh and os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE) as f:
+                cache = json.load(f)
+            if time.time() - cache.get("fetched_at", 0) < CACHE_MAX_AGE_SEC and cache.get("lot_sizes"):
+                return cache["lot_sizes"]
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # not cached (or cache predates this feature) — trigger a fetch, which
+    # populates and caches lot_sizes as a side effect, then re-read
+    fetch_fo_stock_universe(force_refresh=True)
+    try:
+        with open(CACHE_FILE) as f:
+            return json.load(f).get("lot_sizes", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}

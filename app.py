@@ -33,7 +33,6 @@ from watchlist import Watchlist
 from oi_surge import SurgeBoard
 from confirmation import evaluate
 from charting import render_chart
-from models import FutureQuote
 from gamma_blast import compute_score, should_send_telegram_alert
 import telegram_alert
 
@@ -146,16 +145,8 @@ def background_loop():
                             watchlist.mark_confirmed(entry)
                             setups_new.append(setup)
 
-                # --- Gamma Blast scoring for this expiry's chain
-                all_ce = [s for s in symbol_strikes if s.expiry == expiry and s.option_type == "CE"]
-                all_pe = [s for s in symbol_strikes if s.expiry == expiry and s.option_type == "PE"]
-                avg_volume = (sum(c.volume for c in candles[-20:]) / min(20, len(candles))) if candles else None
-                futures_raw = feed.get_futures_quote(symbol) if hasattr(feed, "get_futures_quote") else None
-                futures = FutureQuote(symbol=symbol, price=futures_raw["price"], oi=futures_raw["oi"],
-                                       timestamp=candles[-1].timestamp) if futures_raw else None
-
-                gscore = compute_score(symbol, candles, near_ce, near_pe, all_ce, all_pe,
-                                        futures=futures, avg_volume=avg_volume)
+                # --- Gamma Blast scoring: gated on SR proximity, ATM/next-strike buildup
+                gscore = compute_score(symbol, candles, sr_levels, near_ce, near_pe)
                 if gscore and gscore.alert_level != "none":
                     gamma_scores_new.append(gscore)
                     if should_send_telegram_alert(gscore):
@@ -235,9 +226,14 @@ def api_watchlist():
 def api_surge():
     def fmt(item):
         s = item["strike_obj"]
-        return {"symbol": s.symbol, "strike": s.strike, "oi": s.oi,
-                "change_pct": round(item["change_pct"], 1) if item["change_pct"] is not None else None,
-                "detected_at": item["detected_at"].strftime("%H:%M:%S")}
+        return {
+            "symbol": s.symbol, "strike": s.strike, "oi": s.oi,
+            "change_pct": round(item["change_pct"], 1) if item["change_pct"] is not None else None,
+            "build_up": item.get("build_up"),
+            "vol_oi_ratio": round(item["vol_oi_ratio"], 1) if item.get("vol_oi_ratio") is not None else None,
+            "traded_value": item.get("traded_value"),
+            "detected_at": item["detected_at"].strftime("%H:%M:%S"),
+        }
     return jsonify({
         "ce_surge": [fmt(i) for i in surge_board.get_ce_surges()],
         "pe_surge": [fmt(i) for i in surge_board.get_pe_surges()],
@@ -254,7 +250,8 @@ def api_gamma():
             {"symbol": s.symbol, "score": s.total_score, "level": s.alert_level,
              "price": s.price, "components": {k: round(v, 1) for k, v in s.components.items()},
              "key_strike": (f"{s.key_strike.strike:.0f} {s.key_strike.option_type}"
-                            if s.key_strike else None)}
+                            if s.key_strike else None),
+             "setup_note": s.setup_note}
             for s in scores
         ],
         "alert_log": alert_log,
@@ -367,12 +364,12 @@ PAGE = """
   <div class="surge-cols">
     <div class="card">
       <h2>CE OI Surge <span class="badge" id="ceSurgeCount">0</span></h2>
-      <table id="ceSurgeTable"><tr><th>Symbol</th><th>Strike</th><th>OI</th><th>Delta%</th><th>At</th></tr></table>
+      <table id="ceSurgeTable"><tr><th>Symbol</th><th>Strike</th><th>OI</th><th>Delta%</th><th>Vol/OI</th><th>Traded</th><th>Build-up</th><th>At</th></tr></table>
       <div class="empty" id="ceSurgeEmpty" style="display:none">No CE strikes with &gt;100% OI change in the last 15 min.</div>
     </div>
     <div class="card">
       <h2>PE OI Surge <span class="badge" id="peSurgeCount">0</span></h2>
-      <table id="peSurgeTable"><tr><th>Symbol</th><th>Strike</th><th>OI</th><th>Delta%</th><th>At</th></tr></table>
+      <table id="peSurgeTable"><tr><th>Symbol</th><th>Strike</th><th>OI</th><th>Delta%</th><th>Vol/OI</th><th>Traded</th><th>Build-up</th><th>At</th></tr></table>
       <div class="empty" id="peSurgeEmpty" style="display:none">No PE strikes with &gt;100% OI change in the last 15 min.</div>
     </div>
   </div>
@@ -459,22 +456,29 @@ async function refreshWatchlist() {
 
 async function refreshSurge() {
   const r = await fetch('/api/surge'); const d = await r.json();
+  const fmtTraded = v => v == null ? '-' : (v >= 10000000 ? (v/10000000).toFixed(2)+'Cr' : (v/100000).toFixed(2)+'L');
+  const buClass = b => b === 'Short Buildup' ? 'tag-CE' : (b === 'Long Buildup' || b === 'Short Covering' ? 'tag-PE' : '');
+
   const ce = document.getElementById('ceSurgeTable');
-  ce.innerHTML = '<tr><th>Symbol</th><th>Strike</th><th>OI</th><th>Delta%</th><th>At</th></tr>';
+  ce.innerHTML = '<tr><th>Symbol</th><th>Strike</th><th>OI</th><th>Delta%</th><th>Vol/OI</th><th>Traded</th><th>Build-up</th><th>At</th></tr>';
   document.getElementById('ceSurgeCount').textContent = d.ce_surge.length;
   document.getElementById('ceSurgeEmpty').style.display = d.ce_surge.length ? 'none' : 'block';
   d.ce_surge.forEach(s => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${s.symbol}</td><td>${s.strike}</td><td>${fmtNum(s.oi)}</td><td>+${s.change_pct}%</td><td>${s.detected_at}</td>`;
+    tr.innerHTML = `<td>${s.symbol}</td><td>${s.strike}</td><td>${fmtNum(s.oi)}</td><td>+${s.change_pct}%</td>
+      <td>${s.vol_oi_ratio ?? '-'}x</td><td>\u20B9${fmtTraded(s.traded_value)}</td>
+      <td class="${buClass(s.build_up)}">${s.build_up ?? '-'}</td><td>${s.detected_at}</td>`;
     ce.appendChild(tr);
   });
   const pe = document.getElementById('peSurgeTable');
-  pe.innerHTML = '<tr><th>Symbol</th><th>Strike</th><th>OI</th><th>Delta%</th><th>At</th></tr>';
+  pe.innerHTML = '<tr><th>Symbol</th><th>Strike</th><th>OI</th><th>Delta%</th><th>Vol/OI</th><th>Traded</th><th>Build-up</th><th>At</th></tr>';
   document.getElementById('peSurgeCount').textContent = d.pe_surge.length;
   document.getElementById('peSurgeEmpty').style.display = d.pe_surge.length ? 'none' : 'block';
   d.pe_surge.forEach(s => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${s.symbol}</td><td>${s.strike}</td><td>${fmtNum(s.oi)}</td><td>+${s.change_pct}%</td><td>${s.detected_at}</td>`;
+    tr.innerHTML = `<td>${s.symbol}</td><td>${s.strike}</td><td>${fmtNum(s.oi)}</td><td>+${s.change_pct}%</td>
+      <td>${s.vol_oi_ratio ?? '-'}x</td><td>\u20B9${fmtTraded(s.traded_value)}</td>
+      <td class="${buClass(s.build_up)}">${s.build_up ?? '-'}</td><td>${s.detected_at}</td>`;
     pe.appendChild(tr);
   });
 }
@@ -485,7 +489,7 @@ async function refreshGamma() {
   box.innerHTML = '';
   document.getElementById('gammaCount').textContent = d.scores.length;
   document.getElementById('gammaEmpty').style.display = d.scores.length ? 'none' : 'block';
-  const compLabels = {momentum: 'Momentum', gamma_concentration: 'Gamma Conc.', iv: 'IV Exp.', futures: 'Futures', expiry: 'Expiry'};
+  const compLabels = {oi_unwind: 'OI Unwind', volume_rise: 'Volume Rise', premium_rise: 'Premium Rise'};
   d.scores.forEach(s => {
     const card = document.createElement('div');
     card.className = 'gamma-card gamma-' + s.level;
@@ -498,7 +502,7 @@ async function refreshGamma() {
       <div class="gamma-title"><span>${icon} ${s.symbol} &middot; \u20B9${s.price.toFixed(2)}</span>
         <span class="gamma-score-${s.level}">${s.score.toFixed(0)}/100</span></div>
       <div class="gamma-components">${compsHtml}</div>
-      <div class="gamma-meta">Key strike: ${s.key_strike ?? '-'} &middot; Level: ${s.level.toUpperCase()}</div>`;
+      <div class="gamma-meta">${s.setup_note ?? ''} &middot; Key strike: ${s.key_strike ?? '-'}</div>`;
     box.appendChild(card);
   });
 

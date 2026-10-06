@@ -51,6 +51,31 @@ OI_CHANGE_LOOKUP_TOLERANCE_MIN = 3  # how far off-target a stored snapshot can b
                                      # and still be used as the "15 min ago" baseline
 
 # ---------------------------------------------------------------------------
+# OI Surge quality filters — added after reviewing a real scanner screenshot:
+# your raw >100% rule alone fires on 1-lot-to-2-lot noise (e.g. a contract
+# with 1 lot of OI going to 2 lots is technically "+100%" but meaningless).
+# These filters require real liquidity before something counts as a surge.
+# ---------------------------------------------------------------------------
+OI_SURGE_MIN_OI_BASE = 100        # baseline OI must be at least this many (lots or shares,
+                                   # matches whatever unit your broker's OI field uses)
+OI_SURGE_MIN_TRADED_VALUE = 1_000_000   # ~₹10L, per the reference scanner's "Traded ₹10 lakh+" filter
+OI_SURGE_MIN_VOL_OI_RATIO = 4.0   # today's volume must be >= 4x the OI baseline (screenshot showed
+                                   # 8 of 11 real surges at 4x+; treat this as a starting point, tune
+                                   # once you're comparing against real days)
+
+# Fyers' optionchain `volume` field is in LOTS (contracts), not raw shares —
+# cross-checked against a real scanner screenshot: NIFTY 21100 PE showed
+# volume=33973, ltp=1.20(close), traded=₹19.4L. shares-mode gives ₹40.7K
+# (off by ~47x, clearly wrong); lots-mode with a 75 lot size gives ₹30.6L,
+# the right order of magnitude — the remaining gap is expected, since their
+# "Traded ₹" is a volume-weighted average price across the day while we
+# only have the closing LTP (down 14.3% that day, so the day's average
+# price was higher than the close). Still worth re-checking against a live
+# response once you're running this for real, but this is now
+# evidence-based rather than a guess.
+VOLUME_UNIT = "lots"  # "shares" | "lots"
+
+# ---------------------------------------------------------------------------
 # Confirmation conditions (checked only after a significant OI change fires)
 # ---------------------------------------------------------------------------
 CONFIRM_VOLUME_MULT = 1.5     # current volume >= 1.5x average volume
@@ -67,37 +92,39 @@ WATCHLIST_MAX_SIZE = 50
 SETUP_VALID_FOR_MIN = 60      # a generated setup expires after N minutes if untraded
 
 # ---------------------------------------------------------------------------
-# Gamma Blast strategy — scoring-based gamma squeeze detector
+# Gamma Blast strategy v2 — short-covering / stop-loss-hunt squeeze detector
 # ---------------------------------------------------------------------------
-GAMMA_WINDOW_MIN = 15  # all components measured over this rolling window, per your spec
+# Logic: spot near an SR level -> look at the ATM + next strike on the
+# matching side (CE for resistance, PE for support) -> if that strike has
+# the highest OI among the near-money set (real buildup) -> watch its
+# 15-min trend for OI falling + volume rising + premium rising together
+# across GAMMA_TREND_CANDLES consecutive candles (sellers getting stopped
+# out and covering). If the trend is NOT monotonic across all those candles,
+# score is 0 — this is a trend confirmation, not just a net change.
+GAMMA_WINDOW_MIN = 15                # candle size for the trend, per your spec
+GAMMA_TREND_CANDLES = 3              # consecutive candles required to confirm the trend
+GAMMA_SR_PROXIMITY_PCT = 0.5         # how close price must be to an SR level to gate a setup
 
-# Your weights: momentum 20, gamma concentration 20, IV 15, futures 10, expiry 10 = 75.
-# They don't sum to 100 — GAMMA_NORMALIZE_WEIGHTS rescales them proportionally so the
-# final score still lands on a 0-100 scale. Set this False (and adjust the weights
-# below to sum to 100 yourself) if you actually intended a 6th unlisted factor
-# instead of a rescale.
+# Weights (sum to 100) — you didn't specify a split, so these are my
+# defaults with reasoning: OI unwind is the actual confirming event
+# (sellers exiting), volume confirms it's real activity, premium is the
+# lagging/result signal. Change freely.
 GAMMA_NORMALIZE_WEIGHTS = True
-GAMMA_WEIGHT_MOMENTUM = 20
-GAMMA_WEIGHT_GAMMA_CONCENTRATION = 20
-GAMMA_WEIGHT_IV = 15
-GAMMA_WEIGHT_FUTURES = 10
-GAMMA_WEIGHT_EXPIRY = 10
+GAMMA_WEIGHT_OI_UNWIND = 40
+GAMMA_WEIGHT_VOLUME_RISE = 35
+GAMMA_WEIGHT_PREMIUM_RISE = 25
 
-# Component normalization thresholds — the input value that maps to a full
-# 100 on that component's own 0-100 scale, before weighting.
-GAMMA_MOMENTUM_PRICE_PCT_FOR_100 = 1.5     # 1.5% price move in the window = full marks
-GAMMA_MOMENTUM_VOLUME_MULT_FOR_100 = 4.0   # 4x average volume = full marks
-GAMMA_CONCENTRATION_SHARE_FOR_100 = 0.35   # near-money OI = 35% of that side's total chain OI = full marks
-GAMMA_IV_PCT_CHANGE_FOR_100 = 20.0         # +20% IV (or premium proxy) change in window = full marks
-GAMMA_FUTURES_OI_DROP_FOR_100 = 15.0       # futures OI down 15% + price up = full short-covering marks
-GAMMA_EXPIRY_DAYS_FOR_ZERO = 7             # 7+ days to expiry = 0 on this component
-GAMMA_EXPIRY_DAYS_FOR_100 = 0              # expiry day itself = full marks
+# Component normalization — the total change across the full
+# GAMMA_TREND_CANDLES window that maps to a full 100 on that component's
+# own scale, before weighting (only applies once the monotonicity gate passes)
+GAMMA_OI_UNWIND_PCT_FOR_100 = 30.0      # OI down 30% across the window = full marks
+GAMMA_VOLUME_RISE_MULT_FOR_100 = 3.0    # period volume tripling = full marks
+GAMMA_PREMIUM_RISE_PCT_FOR_100 = 25.0   # premium up 25% across the window = full marks
 
-# Alert level thresholds (your spec)
-GAMMA_ALERT_STRONG = 80    # 80-100: strong gamma-squeeze setup
-GAMMA_ALERT_WATCH = 65     # 65-79: watch closely
-GAMMA_ALERT_DEVELOPING = 50  # 50-64: developing; below this = no alert
+# Alert level thresholds (unchanged from before)
+GAMMA_ALERT_STRONG = 80
+GAMMA_ALERT_WATCH = 65
+GAMMA_ALERT_DEVELOPING = 50
 
-GAMMA_TELEGRAM_THRESHOLD = 80   # only scores >= this trigger a Telegram push (per your sequence diagram)
-GAMMA_TELEGRAM_RE_ALERT_COOLDOWN_MIN = 30  # don't re-push the same symbol within this window
-                                            # even if it stays above threshold
+GAMMA_TELEGRAM_THRESHOLD = 80
+GAMMA_TELEGRAM_RE_ALERT_COOLDOWN_MIN = 30

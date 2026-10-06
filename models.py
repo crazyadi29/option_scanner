@@ -41,13 +41,20 @@ class OIStrike:
     volume: Optional[int] = None
     timestamp: Optional[datetime] = None
     iv: Optional[float] = None       # implied volatility, % — populated where the broker provides it
-    ltp: Optional[float] = None      # option premium, used as an IV proxy when iv is unavailable
+    ltp: Optional[float] = None      # option premium
+    ltp_prev_baseline: Optional[float] = None  # premium from the same rolling-window baseline as OI
 
     @property
     def oi_change_pct(self) -> Optional[float]:
         if not self.oi_prev_baseline or self.oi_prev_baseline == 0:
             return None
         return ((self.oi - self.oi_prev_baseline) / self.oi_prev_baseline) * 100.0
+
+    @property
+    def ltp_change_pct(self) -> Optional[float]:
+        if not self.ltp_prev_baseline or self.ltp is None:
+            return None
+        return ((self.ltp - self.ltp_prev_baseline) / self.ltp_prev_baseline) * 100.0
 
 
 @dataclass
@@ -76,7 +83,7 @@ class FutureQuote:
 class GammaScore:
     symbol: str
     total_score: float
-    components: dict          # {"momentum":.., "gamma_concentration":.., "iv":.., "futures":.., "expiry":..}
+    components: dict          # gamma_blast v2: {"oi_unwind":.., "volume_rise":.., "premium_rise":..}
     alert_level: str          # "strong" | "watch" | "developing" | "none"
     price: float
     key_strike: Optional[OIStrike] = None

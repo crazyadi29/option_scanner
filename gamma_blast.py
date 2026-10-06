@@ -1,81 +1,78 @@
 """
 gamma_blast.py
 --------------
-Gamma Blast strategy: scoring-based gamma-squeeze detector.
+Gamma Blast v2 — short-covering / stop-loss-hunt squeeze detector.
 
-    NSE F&O data -> option-chain scanner -> Gamma/OI/Volume/IV analysis
-    -> Gamma Score (0-100) -> filter Score >= 80 -> Telegram alert
+Logic:
+    1. GATE: spot price must be near an important support or resistance level.
+    2. Direction: near resistance -> watch the CALL side. Near support ->
+       watch the PUT side.
+    3. GATE: among the ATM strike and the next strike out (OTM direction),
+       the one with the higher OI is the "buildup strike" — this is where
+       option sellers are concentrated.
+    4. Trend confirmation, over GAMMA_TREND_CANDLES (default 3) consecutive
+       15-min candles: OI falling + volume rising + premium rising, all
+       three, every candle-to-candle step. This is the signature of sellers
+       getting stopped out and buying back to cover (OI unwinds as volume
+       and premium spike) — the actual gamma squeeze.
+    5. If the trend isn't monotonic across all those candles, score is 0 —
+       this scores trend CONFIRMATION, not just net change over the window.
 
-Score components (your weights, auto-normalized to sum to 100 —
-see config.GAMMA_NORMALIZE_WEIGHTS):
-    Price + volume momentum         20%
-    Near-ATM gamma concentration    20%
-    IV expansion                    15%
-    Short covering / futures OI     10%
-    Expiry proximity                10%
+Score = weighted blend of how much OI fell / volume rose / premium rose
+across the confirmed window (config.GAMMA_WEIGHT_*).
 
-All components are measured over a rolling config.GAMMA_WINDOW_MIN (15 min)
-window, same rolling-history pattern as the OI surge tracker.
-
-Data availability note: real IV and futures OI/price aren't wired into
-every feed yet.
-    - SimulatedFeed: generates synthetic IV and futures data so this whole
-      module is testable end-to-end today.
-    - KiteFeed: doesn't currently pull IV or futures quotes — falls back to
-      the option premium (ltp) as an IV proxy, and the futures component
-      scores 0 until wired up.
-    - FyersFeed: optionchain() can return IV directly if requested with
-      greeks — not yet requested in fyers_feed.py; same fallback applies
-      until that's added.
-This is flagged in-code (see `iv or ltp` fallback below) so nothing pretends
-to have data it doesn't.
+Data note: this needs per-strike OI/volume/premium(ltp) history sampled
+over time, which this module builds itself (see _history) from whatever
+OIStrike objects you pass to compute_score() each tick — no separate feed
+wiring needed beyond what's already flowing through the app.
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from bisect import bisect_left
 
 import config
-from models import Candle, OIStrike, FutureQuote, GammaScore
+from models import Candle, SRLevel, OIStrike, GammaScore
 
-# rolling history: key -> [(timestamp, value), ...]
-_price_history: Dict[str, list] = {}
-_volume_history: Dict[str, list] = {}
-_near_oi_history: Dict[str, list] = {}          # symbol -> [(ts, near_money_oi_sum)]
-_iv_history: Dict[tuple, list] = {}             # (symbol, strike, option_type) -> [(ts, iv_or_premium)]
-_futures_oi_history: Dict[str, list] = {}
-_futures_price_history: Dict[str, list] = {}
+# (symbol, strike, option_type) -> [(timestamp, oi, volume, ltp), ...] sorted by time
+_history: Dict[tuple, list] = {}
 
-_last_telegram_alert: Dict[str, datetime] = {}  # symbol -> last time we pushed a Telegram alert
+_last_telegram_alert: Dict[str, datetime] = {}
 
 
-def _record(store: dict, key, ts: datetime, value):
-    store.setdefault(key, [])
-    store[key].append((ts, value))
-    # keep ~2 windows of history, drop older
-    cutoff = ts - timedelta(minutes=config.GAMMA_WINDOW_MIN * 3)
-    store[key] = [(t, v) for t, v in store[key] if t >= cutoff]
+def _record(key: tuple, ts: datetime, oi, volume, ltp):
+    _history.setdefault(key, [])
+    _history[key].append((ts, oi, volume, ltp))
+    cutoff = ts - timedelta(minutes=config.GAMMA_WINDOW_MIN * (config.GAMMA_TREND_CANDLES + 2))
+    _history[key] = [h for h in _history[key] if h[0] >= cutoff]
 
 
-def _lookback_value(store: dict, key, current_ts: datetime, window_min: int):
-    history = store.get(key, [])
+def _bucket_end_values(key: tuple, now: datetime):
+    """Returns up to (GAMMA_TREND_CANDLES + 1) values, one per completed
+    GAMMA_WINDOW_MIN-minute bucket ending at or before `now`, each as
+    (bucket_end_ts, oi, cumulative_volume, ltp) using the last observation
+    within that bucket. Returns fewer if there isn't enough history yet."""
+    history = _history.get(key, [])
     if len(history) < 2:
-        return None
-    target = current_ts - timedelta(minutes=window_min)
-    timestamps = [h[0] for h in history]
-    pos = bisect_left(timestamps, target)
-    candidates = []
-    if pos < len(history):
-        candidates.append(history[pos])
-    if pos > 0:
-        candidates.append(history[pos - 1])
-    if not candidates:
-        return None
-    best = min(candidates, key=lambda c: abs((c[0] - target).total_seconds()))
-    return best[1]
+        return []
+
+    n_buckets = config.GAMMA_TREND_CANDLES + 1
+    window = timedelta(minutes=config.GAMMA_WINDOW_MIN)
+
+    # bucket boundaries: ..., now-2*window, now-window, now
+    boundaries = [now - window * i for i in range(n_buckets, -1, -1)]
+    results = []
+    for i in range(len(boundaries) - 1):
+        b_start, b_end = boundaries[i], boundaries[i + 1]
+        in_bucket = [h for h in history if b_start < h[0] <= b_end]
+        if not in_bucket:
+            continue
+        last = max(in_bucket, key=lambda h: h[0])
+        results.append((b_end, last[1], last[2], last[3]))
+    return results
 
 
 def _pct_change(old, new):
-    if old is None or old == 0:
+    if old is None or old == 0 or new is None:
         return None
     return ((new - old) / old) * 100.0
 
@@ -84,147 +81,140 @@ def _clamp(x, lo=0.0, hi=100.0):
     return max(lo, min(hi, x))
 
 
-# ---------------------------------------------------------------------------
-# Component scorers — each returns 0-100
-# ---------------------------------------------------------------------------
-
-def _score_momentum(symbol: str, current_price: float, current_volume: float,
-                     avg_volume: Optional[float], now: datetime) -> float:
-    _record(_price_history, symbol, now, current_price)
-    old_price = _lookback_value(_price_history, symbol, now, config.GAMMA_WINDOW_MIN)
-    price_pct = abs(_pct_change(old_price, current_price) or 0)
-    price_component = _clamp(price_pct / config.GAMMA_MOMENTUM_PRICE_PCT_FOR_100 * 100)
-
-    vol_mult = (current_volume / avg_volume) if avg_volume else 0
-    volume_component = _clamp(vol_mult / config.GAMMA_MOMENTUM_VOLUME_MULT_FOR_100 * 100)
-
-    return (price_component + volume_component) / 2
+def _find_nearby_level(sr_levels: List[SRLevel], current_price: float, kind: str) -> Optional[SRLevel]:
+    proximity = current_price * (config.GAMMA_SR_PROXIMITY_PCT / 100.0)
+    candidates = [l for l in sr_levels if l.kind == kind and abs(l.price - current_price) <= proximity]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda l: abs(l.price - current_price))
 
 
-def _score_gamma_concentration(symbol: str, near_money_ce: List[OIStrike],
-                                near_money_pe: List[OIStrike],
-                                all_ce: List[OIStrike], all_pe: List[OIStrike],
-                                now: datetime) -> float:
-    near_oi = sum(s.oi for s in near_money_ce) + sum(s.oi for s in near_money_pe)
-    total_oi = sum(s.oi for s in all_ce) + sum(s.oi for s in all_pe)
-    if total_oi == 0:
-        return 0.0
-    share = near_oi / total_oi
-    return _clamp(share / config.GAMMA_CONCENTRATION_SHARE_FOR_100 * 100)
+def _pick_buildup_strike(near_money: List[OIStrike], current_price: float,
+                          side: str) -> Optional[OIStrike]:
+    """ATM + the next strike out (OTM direction for that side); returns
+    whichever of those two has the higher OI — that's the buildup strike."""
+    if not near_money:
+        return None
+    sorted_strikes = sorted(near_money, key=lambda s: s.strike)
+    atm = min(sorted_strikes, key=lambda s: abs(s.strike - current_price))
+    idx = sorted_strikes.index(atm)
+
+    if side == "CE":
+        next_strike = sorted_strikes[idx + 1] if idx + 1 < len(sorted_strikes) else None
+    else:  # PE — OTM direction is downward
+        next_strike = sorted_strikes[idx - 1] if idx - 1 >= 0 else None
+
+    candidates = [s for s in (atm, next_strike) if s is not None]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda s: s.oi)
 
 
-def _score_iv_expansion(symbol: str, near_money_ce: List[OIStrike],
-                         near_money_pe: List[OIStrike], now: datetime) -> float:
-    strikes = near_money_ce + near_money_pe
-    if not strikes:
-        return 0.0
-    values = [(s.iv if s.iv is not None else s.ltp) for s in strikes]
-    values = [v for v in values if v is not None]
-    if not values:
-        return 0.0
-    current_avg = sum(values) / len(values)
+def _score_trend(key: tuple, now: datetime):
+    """Returns (oi_score, volume_score, premium_score, debug_dict) or all
+    zeros if there isn't enough history or the trend isn't monotonic across
+    every consecutive candle."""
+    buckets = _bucket_end_values(key, now)
+    if len(buckets) < config.GAMMA_TREND_CANDLES + 1:
+        return 0.0, 0.0, 0.0, {"reason": "insufficient history"}
 
-    key = symbol
-    _record(_iv_history, key, now, current_avg)
-    old_avg = _lookback_value(_iv_history, key, now, config.GAMMA_WINDOW_MIN)
-    pct = _pct_change(old_avg, current_avg)
-    if pct is None:
-        return 0.0
-    return _clamp(pct / config.GAMMA_IV_PCT_CHANGE_FOR_100 * 100)
+    # last N+1 buckets -> N candle-to-candle steps
+    buckets = buckets[-(config.GAMMA_TREND_CANDLES + 1):]
 
+    oi_series = [b[1] for b in buckets]
+    vol_cum_series = [b[2] for b in buckets]
+    ltp_series = [b[3] for b in buckets]
 
-def _score_futures(symbol: str, futures: Optional[FutureQuote], now: datetime) -> float:
-    if futures is None:
-        return 0.0
-    _record(_futures_oi_history, symbol, now, futures.oi)
-    _record(_futures_price_history, symbol, now, futures.price)
+    # per-bucket traded volume = delta of cumulative volume (Fyers/Kite both
+    # report cumulative-for-the-day volume, not per-candle)
+    vol_period_series = [vol_cum_series[i] - vol_cum_series[i - 1] for i in range(1, len(vol_cum_series))]
 
-    old_oi = _lookback_value(_futures_oi_history, symbol, now, config.GAMMA_WINDOW_MIN)
-    old_price = _lookback_value(_futures_price_history, symbol, now, config.GAMMA_WINDOW_MIN)
-    oi_pct = _pct_change(old_oi, futures.oi)
-    price_pct = _pct_change(old_price, futures.price)
-    if oi_pct is None or price_pct is None:
-        return 0.0
+    oi_steps_down = all(oi_series[i] < oi_series[i - 1] for i in range(1, len(oi_series)))
+    vol_steps_up = all(vol_period_series[i] > vol_period_series[i - 1] for i in range(1, len(vol_period_series))) \
+        if len(vol_period_series) > 1 else (len(vol_period_series) == 1)
+    premium_steps_up = all(ltp_series[i] > ltp_series[i - 1] for i in range(1, len(ltp_series)))
 
-    # short covering signature: OI falling while price rising
-    if oi_pct < 0 and price_pct > 0:
-        drop_component = _clamp(abs(oi_pct) / config.GAMMA_FUTURES_OI_DROP_FOR_100 * 100)
-        return drop_component
-    return 0.0
+    debug = {
+        "oi_series": oi_series, "vol_period_series": vol_period_series, "ltp_series": ltp_series,
+        "oi_monotonic_down": oi_steps_down, "vol_monotonic_up": vol_steps_up,
+        "premium_monotonic_up": premium_steps_up,
+    }
 
+    if not (oi_steps_down and vol_steps_up and premium_steps_up):
+        return 0.0, 0.0, 0.0, debug
 
-def _score_expiry(expiry_str: str, now: datetime) -> float:
-    try:
-        expiry_date = datetime.fromisoformat(expiry_str).date()
-    except (ValueError, TypeError):
-        return 0.0  # unknown/placeholder expiry (e.g. Fyers "current") — can't score this component
-    days_left = (expiry_date - now.date()).days
-    if days_left <= config.GAMMA_EXPIRY_DAYS_FOR_100:
-        return 100.0
-    if days_left >= config.GAMMA_EXPIRY_DAYS_FOR_ZERO:
-        return 0.0
-    span = config.GAMMA_EXPIRY_DAYS_FOR_ZERO - config.GAMMA_EXPIRY_DAYS_FOR_100
-    return _clamp((config.GAMMA_EXPIRY_DAYS_FOR_ZERO - days_left) / span * 100)
+    oi_pct = _pct_change(oi_series[0], oi_series[-1]) or 0
+    oi_score = _clamp(abs(min(oi_pct, 0)) / config.GAMMA_OI_UNWIND_PCT_FOR_100 * 100)
+
+    vol_mult = (vol_period_series[-1] / vol_period_series[0]) if vol_period_series[0] > 0 else 0
+    vol_score = _clamp(vol_mult / config.GAMMA_VOLUME_RISE_MULT_FOR_100 * 100)
+
+    premium_pct = _pct_change(ltp_series[0], ltp_series[-1]) or 0
+    premium_score = _clamp(max(premium_pct, 0) / config.GAMMA_PREMIUM_RISE_PCT_FOR_100 * 100)
+
+    return oi_score, vol_score, premium_score, debug
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-def compute_score(symbol: str, candles: List[Candle],
-                   near_money_ce: List[OIStrike], near_money_pe: List[OIStrike],
-                   all_ce: List[OIStrike], all_pe: List[OIStrike],
-                   futures: Optional[FutureQuote] = None,
-                   avg_volume: Optional[float] = None) -> Optional[GammaScore]:
+def compute_score(symbol: str, candles: List[Candle], sr_levels: List[SRLevel],
+                   near_money_ce: List[OIStrike], near_money_pe: List[OIStrike]) -> Optional[GammaScore]:
     if not candles:
         return None
-    now = datetime.now()
+    # Use the data's own timestamp as "now", not wall-clock time — this is
+    # what makes the module correct for both live use and backtesting/
+    # fast-forwarded simulation, where candle timestamps don't match real time.
+    now = candles[-1].timestamp
     current_price = candles[-1].close
-    current_volume = candles[-1].volume
 
-    momentum = _score_momentum(symbol, current_price, current_volume, avg_volume, now)
-    gamma_conc = _score_gamma_concentration(symbol, near_money_ce, near_money_pe, all_ce, all_pe, now)
-    iv = _score_iv_expansion(symbol, near_money_ce, near_money_pe, now)
-    futures_score = _score_futures(symbol, futures, now)
+    # record every near-money strike's current reading, regardless of
+    # whether a setup is active right now — history needs to accumulate
+    # continuously so it's ready when a gate does pass
+    for s in (near_money_ce + near_money_pe):
+        _record((symbol, s.strike, s.option_type), s.timestamp or now, s.oi, s.volume or 0, s.ltp)
 
-    expiry_str = (near_money_ce[0].expiry if near_money_ce
-                  else near_money_pe[0].expiry if near_money_pe else None)
-    expiry = _score_expiry(expiry_str, now) if expiry_str else 0.0
+    resistance = _find_nearby_level(sr_levels, current_price, "resistance")
+    support = _find_nearby_level(sr_levels, current_price, "support")
+
+    if resistance is not None:
+        side, level, near_money = "CE", resistance, near_money_ce
+    elif support is not None:
+        side, level, near_money = "PE", support, near_money_pe
+    else:
+        return None  # gate 1 failed: not near any SR level
+
+    buildup_strike = _pick_buildup_strike(near_money, current_price, side)
+    if buildup_strike is None:
+        return None  # gate 2 failed: no usable near-money strike
+
+    key = (symbol, buildup_strike.strike, buildup_strike.option_type)
+    oi_score, vol_score, premium_score, debug = _score_trend(key, now)
 
     weights = {
-        "momentum": config.GAMMA_WEIGHT_MOMENTUM,
-        "gamma_concentration": config.GAMMA_WEIGHT_GAMMA_CONCENTRATION,
-        "iv": config.GAMMA_WEIGHT_IV,
-        "futures": config.GAMMA_WEIGHT_FUTURES,
-        "expiry": config.GAMMA_WEIGHT_EXPIRY,
+        "oi_unwind": config.GAMMA_WEIGHT_OI_UNWIND,
+        "volume_rise": config.GAMMA_WEIGHT_VOLUME_RISE,
+        "premium_rise": config.GAMMA_WEIGHT_PREMIUM_RISE,
     }
     total_weight = sum(weights.values())
     scale = (100.0 / total_weight) if config.GAMMA_NORMALIZE_WEIGHTS else 1.0
 
-    components = {
-        "momentum": momentum, "gamma_concentration": gamma_conc,
-        "iv": iv, "futures": futures_score, "expiry": expiry,
-    }
+    components = {"oi_unwind": oi_score, "volume_rise": vol_score, "premium_rise": premium_score}
     total_score = sum(components[k] * weights[k] for k in weights) / 100.0 * scale
     total_score = round(_clamp(total_score), 1)
 
     if total_score >= config.GAMMA_ALERT_STRONG:
-        level = "strong"
+        alert_level = "strong"
     elif total_score >= config.GAMMA_ALERT_WATCH:
-        level = "watch"
+        alert_level = "watch"
     elif total_score >= config.GAMMA_ALERT_DEVELOPING:
-        level = "developing"
+        alert_level = "developing"
     else:
-        level = "none"
+        alert_level = "none"
 
-    # key strike: highest-OI near-money strike on whichever side is stronger
-    all_near = near_money_ce + near_money_pe
-    key_strike = max(all_near, key=lambda s: s.oi) if all_near else None
+    setup_note = f"{level.kind.capitalize()} {level.price:.1f} nearby, {side} buildup at {buildup_strike.strike:.0f}"
 
     return GammaScore(
         symbol=symbol, total_score=total_score, components=components,
-        alert_level=level, price=current_price, key_strike=key_strike,
-        futures=futures, computed_at=now,
+        alert_level=alert_level, price=current_price, key_strike=buildup_strike,
+        futures=None, computed_at=now, setup_note=setup_note,
     )
 
 

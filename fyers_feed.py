@@ -40,6 +40,7 @@ Setup:
   2. Run fyers_auth.py each trading morning for a fresh token
   3. Set FYERS_CLIENT_ID env var (token itself is read from fyers_token.json)
 """
+import os
 import json
 import logging
 import threading
@@ -90,6 +91,11 @@ def _compute_recommended_interval(num_symbols: int) -> int:
 
 class FyersFeed:
     def __init__(self, client_id: str, access_token: str = None, universe=None):
+        # Resolution order: explicit arg > FYERS_ACCESS_TOKEN env var (what
+        # fyers_auto_auth.py writes to Railway in production) > local
+        # fyers_token.json (what fyers_auth.py writes for local dev).
+        if access_token is None:
+            access_token = os.environ.get("FYERS_ACCESS_TOKEN")
         if access_token is None:
             with open(TOKEN_FILE) as f:
                 access_token = json.load(f)["access_token"]

@@ -37,7 +37,7 @@ COLUMN_MAP = {
     "timestamp": "timestamp",
 }
 
-# Time-series store: {(symbol, expiry, strike, option_type): [(timestamp, oi), ...]}
+# Time-series store: {(symbol, expiry, strike, option_type): [(timestamp, oi, ltp), ...]}
 # sorted ascending by timestamp. Swap for a real DB (SQLite/Redis/Timescale)
 # once you go live — fine for backtesting / early paper trading as-is.
 _history_store: Dict[tuple, list] = {}
@@ -55,8 +55,8 @@ def _ensure_dt(ts) -> datetime:
 
 def record_snapshot(raw_rows) -> List[OIStrike]:
     """Ingest one option-chain snapshot, append to history, and return
-    OIStrike objects for this snapshot (with rolling-window baseline attached
-    if enough history exists yet)."""
+    OIStrike objects for this snapshot (with rolling-window OI and premium
+    baselines attached if enough history exists yet)."""
     strikes = []
     for r in raw_rows:
         k = _key({
@@ -65,29 +65,31 @@ def record_snapshot(raw_rows) -> List[OIStrike]:
         })
         ts = _ensure_dt(r[COLUMN_MAP["timestamp"]])
         oi = r[COLUMN_MAP["oi"]]
+        ltp = r.get("ltp")
 
         _history_store.setdefault(k, [])
-        _history_store[k].append((ts, oi))
+        _history_store[k].append((ts, oi, ltp))
         _history_store[k].sort(key=lambda x: x[0])
 
-        baseline = _lookup_rolling_baseline(k, ts)
+        oi_baseline, ltp_baseline = _lookup_rolling_baseline(k, ts)
 
         strikes.append(OIStrike(
             symbol=r[COLUMN_MAP["symbol"]], expiry=r[COLUMN_MAP["expiry"]],
             strike=r[COLUMN_MAP["strike"]], option_type=r[COLUMN_MAP["option_type"]],
-            oi=oi, oi_prev_baseline=baseline,
+            oi=oi, oi_prev_baseline=oi_baseline,
             volume=r.get(COLUMN_MAP["volume"]), timestamp=ts,
-            iv=r.get("iv"), ltp=r.get("ltp"),
+            iv=r.get("iv"), ltp=ltp, ltp_prev_baseline=ltp_baseline,
         ))
     return strikes
 
 
-def _lookup_rolling_baseline(key: tuple, current_ts: datetime) -> Optional[int]:
-    """Find the OI value closest to `current_ts - window` for this strike,
-    within OI_CHANGE_LOOKUP_TOLERANCE_MIN minutes tolerance."""
+def _lookup_rolling_baseline(key: tuple, current_ts: datetime):
+    """Find the OI and ltp values closest to `current_ts - window` for this
+    strike, within OI_CHANGE_LOOKUP_TOLERANCE_MIN minutes tolerance.
+    Returns (oi_baseline, ltp_baseline), either of which may be None."""
     history = _history_store.get(key, [])
     if len(history) < 2:
-        return None
+        return None, None
 
     target_ts = current_ts - timedelta(minutes=config.OI_CHANGE_ROLLING_WINDOW_MIN)
     tolerance = timedelta(minutes=config.OI_CHANGE_LOOKUP_TOLERANCE_MIN)
@@ -103,12 +105,15 @@ def _lookup_rolling_baseline(key: tuple, current_ts: datetime) -> Optional[int]:
 
     best = None
     best_diff = None
-    for ts, oi in candidates:
+    for entry in candidates:
+        ts = entry[0]
         diff = abs((ts - target_ts).total_seconds())
         if diff <= tolerance.total_seconds() and (best_diff is None or diff < best_diff):
-            best, best_diff = oi, diff
+            best, best_diff = entry, diff
 
-    return best
+    if best is None:
+        return None, None
+    return best[1], best[2]
 
 
 # Backward-compatible alias used by scanner.py for an initial baseline load
@@ -175,3 +180,53 @@ def get_significant_oi_changes(strikes: List[OIStrike]) -> List[OIStrike]:
         if pct is not None and abs(pct) >= config.OI_CHANGE_THRESHOLD_PCT:
             flagged.append(s)
     return flagged
+
+
+def classify_build_up(strike: OIStrike) -> Optional[str]:
+    """Classic OI/price build-up classification, from OI change direction
+    x premium change direction (same logic every options scanner uses —
+    this is what the "Build-up" column in your screenshot is):
+        OI up   + premium up   -> "Long Buildup"    (buyers adding)
+        OI up   + premium down -> "Short Buildup"   (writers adding)
+        OI down + premium up   -> "Short Covering"  (writers exiting)
+        OI down + premium down -> "Long Unwinding"  (buyers exiting)
+    Returns None if there isn't enough history yet to classify (needs both
+    an OI and a premium baseline from the rolling window)."""
+    oi_pct = strike.oi_change_pct
+    ltp_pct = strike.ltp_change_pct
+    if oi_pct is None or ltp_pct is None:
+        return None
+    if oi_pct >= 0 and ltp_pct >= 0:
+        return "Long Buildup"
+    if oi_pct >= 0 and ltp_pct < 0:
+        return "Short Buildup"
+    if oi_pct < 0 and ltp_pct >= 0:
+        return "Short Covering"
+    return "Long Unwinding"
+
+
+def get_vol_oi_ratio(strike: OIStrike) -> Optional[float]:
+    """Today's traded volume divided by the OI baseline from the rolling
+    window (proxy for 'volume vs prior OI' — same idea as the Vol÷OI
+    column in your screenshot, though that one uses yesterday's close OI
+    specifically; ours uses the same rolling baseline as everything else
+    here for consistency). Returns None if volume or a baseline is missing."""
+    if strike.volume is None or not strike.oi_prev_baseline:
+        return None
+    return strike.volume / strike.oi_prev_baseline
+
+
+def get_traded_value(strike: OIStrike, lot_size: Optional[int]) -> Optional[float]:
+    """Rough traded value in rupees for this strike today: volume * premium,
+    scaled by lot size if config.VOLUME_UNIT == "lots" (i.e. Fyers' volume
+    field is contracts, not shares — UNVERIFIED, see config.py comment).
+    Returns None if inputs are missing, so callers can decide whether to
+    skip the traded-value filter entirely rather than wrongly reject a
+    strike over incomplete data."""
+    if strike.volume is None or strike.ltp is None:
+        return None
+    if config.VOLUME_UNIT == "lots":
+        if not lot_size:
+            return None  # can't compute traded value without a lot size in this mode
+        return strike.volume * lot_size * strike.ltp
+    return strike.volume * strike.ltp
