@@ -146,7 +146,7 @@ def _obfuscate(value: str) -> str:
 def update_railway_env_and_redeploy(access_token: str):
     api_token = _env("RAILWAY_API_TOKEN")
     project_id = _env("RAILWAY_PROJECT_ID")
-    service_id = _env("RAILWAY_SERVICE_ID")
+    service_id = _env("TARGET_SERVICE_ID")
     environment_id = _env("RAILWAY_ENVIRONMENT_ID")
 
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
